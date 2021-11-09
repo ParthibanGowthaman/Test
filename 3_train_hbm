@@ -1,0 +1,437 @@
+# %
+from factor_analyzer import FactorAnalyzer
+import pdb
+import arviz as az
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import pymc3 as pm
+import theano
+import src.utils.config as cf
+import statsmodels.api as sm
+import mlflow
+import namesgenerator
+import src.utils.io as io
+from loguru import logger as log
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import r2_score, mean_squared_error, mean_absolute_error
+import argparse
+from typing import Any
+from src.models.hbm import model_factory, prepare_dataset, mev_pca_transform, point_estimates_inference
+import distutils.dir_util as dir_util
+from src.utils.utils import get_mlruns_artifact_dir
+from src.utils.utils import return_processed_data
+import joblib
+# %
+
+# % arguments parsing {{{1
+parser = argparse.ArgumentParser(description="hbm model")
+parser.add_argument('-p', '--period', help="forecast, history or all", default="all", type=str, choices=["forecast", "history", "both"])
+parser.add_argument('-x', '--experiment-name', help="mlflow experiment name", default="ci cluster 7 hbm model 19 Oct 2012 Period", type=str)
+parser.add_argument('-X', '--cluster-experiment-id', help="experiment id used to store the cluster model", default="40", type=str)
+parser.add_argument('-R', '--cluster-run-id', help="run id used to store the cluster model", default="6de34b99a84747c1b5057341bb000940", type=str)
+parser.add_argument('-dt', '--data-type', help="run cluster on ci or cre data", default="ci", choices=["ci", "cre_asking_rent", "cre_vacancy", "cre_12M_Rolling_Cap_Rate", "cre_Med_Sale_Price"])
+parser.add_argument('-pt', '--property-type', help="run cluster on selected property types", default="Multifamily,Office,Retail", type=str)
+parser.add_argument('-i', '--cluster-id', help="cluster id", default=7, type=int)
+parser.add_argument('-n', '--n-pca-factors', help="number of factors to use", default=6, type=int, choices=range(1, 14))
+parser.add_argument('-l', '--chain-length', help="size of the sampling chain", default=2000, type=int)
+parser.add_argument('-L', '--posterior-chain-length', help="size of the posterior chain", default=2000, type=int)
+parser.add_argument('-t', '--tune', help="size of the burning period", default=2000, type=int)
+#parser.add_argument('-e', "--exclude-period", help="dont train the model on this period. The input shall take the form yyyy-mm-dd:yyyy-mm-dd", default="2019-01-01:2022-01-01", type=str)
+parser.add_argument('-e', "--exclude-period", help="dont train the model on this period. The input shall take the form yyyy-mm-dd:yyyy-mm-dd", default=None, type=str)
+parser.add_argument('-c', "--cores", help="number of cores to use", default=2, type=int)
+parser.add_argument('-v', "--use-dummy-covid-predictor", help="use extra predictor taking value 1 during covid (2020-01-01:2022-01-01), 0 otherwise", default=0, type=int)
+parser.add_argument('-m', "--mev-base-file", help="file containing the base macroeconomic condition", default="economic_indicators_210507", type=str)
+#parser.add_argument('-m', "--mev-base-file", help="file containing the base macroeconomic condition", default="economic_indicators_agg_model", type=str)
+parser.add_argument('-d', "--dropout-rate", help="rate of observations to be dropped when training the model", default=0.0, type=float)
+parser.add_argument("-hs", "--helper-scenarios", help="use helper scenarios", default=0, type=int)
+parser.add_argument("-ct", "--correlation-threshold", help="correlation threshold for helper scenario", default=0.8, type=float)
+parser.add_argument("--train-period-start", help="first date of the training period (ex: 2012-01-01)", default="2012-10-01", type=str)
+parser.add_argument('-s', '--seed', help='seed', default=42, type=int)
+args, unknown = parser.parse_known_args()
+# % }}}1
+
+# +
+# % PARAMETERS {{{1
+EXPERIMENT_NAME = args.experiment_name
+DATA_TYPE = args.data_type
+PROPERTY_TYPE = args.property_type.split(",")
+PCA_PERIOD_START = "2010-10-01"
+#PCA_PERIOD_START = "1999-10-01"
+PCA_TYPE = "yoy_change"
+PERIOD = args.period
+CLUSTER_ID = args.cluster_id
+CLUSTER_EXPERIMENT_ID = args.cluster_experiment_id
+CLUSTER_RUN_ID = args.cluster_run_id
+N_PCA_FACTORS = args.n_pca_factors
+PARAMS_VAL_LOC = 0
+PARAMS_VAL_SCALE = 100
+PARAMS_DEV = 5
+NOISE_LEV = 5
+CHAIN_LENGTH = args.chain_length
+TUNE = args.tune
+TARGET_ACCEPTANCE = 0.9
+N_SAMPLES_POSTERIOR = args.posterior_chain_length
+HOLD_OUT_CUTOFF = "2024-01-01"
+CORES = args.cores
+
+HELPER_SCENARIOS = args.helper_scenarios # set to True if scenarios be added to improve the fit of the HB Model
+CORRELATION_THRESHOLD = args.correlation_threshold # define the cutoff for helper scenarios to be added
+SEED = args.seed
+
+if args.exclude_period:
+    EXCLUDE_PERIOD_START, EXCLUDE_PERIOD_STOP = args.exclude_period.split(":")
+else:
+    EXCLUDE_PERIOD_START, EXCLUDE_PERIOD_STOP = "2100-01-01", "2000-01-01"
+USE_DUMMY_COVID_PREDICTOR = args.use_dummy_covid_predictor
+MEV_BASE_FILE = args.mev_base_file
+DROPOUT_RATE = args.dropout_rate
+TRAIN_PERIOD_START = args.train_period_start
+BEF_COVID_PERIOD_END = '2019-10-01'
+# % }}}1
+# -
+
+# % mlflow setup
+mlflow.set_tracking_uri(cf.MLFLOW_TRACKING_DIR)
+mlflow.set_experiment(EXPERIMENT_NAME)
+RUN_NAME = namesgenerator.get_random_name()
+RELATIVE_RUN_DIR = f"outputs/hbm/{DATA_TYPE}/{RUN_NAME}/"
+LOCAL_RUN_DIR = cf.PROJECT_DIR + RELATIVE_RUN_DIR
+io.create_dir_if_not_exist(LOCAL_RUN_DIR)
+ARTIFACTS_DIR = LOCAL_RUN_DIR
+mlflow.start_run(run_name=RUN_NAME)
+run = mlflow.active_run()
+log.info(f"Active mlflow {RUN_NAME} run_id: {run.info.run_id}")
+# %
+
+# % log params {{{1
+mlflow.log_param("DATA_TYPE", DATA_TYPE)
+mlflow.log_param("PROPERTY_TYPE", PROPERTY_TYPE)
+mlflow.log_param("PCA_PERIOD_START", PCA_PERIOD_START) 
+mlflow.log_param("PCA_TYPE", PCA_TYPE)
+mlflow.log_param("PERIOD", PERIOD)
+mlflow.log_param("CLUSTER_ID", CLUSTER_ID)
+mlflow.log_param("CLUSTER_EXPERIMENT_ID", CLUSTER_EXPERIMENT_ID)
+mlflow.log_param("CLUSTER_RUN_ID", CLUSTER_RUN_ID)
+mlflow.log_param("N_PCA_FACTORS", N_PCA_FACTORS)
+mlflow.log_param("PARAMS_VAL_LOC", PARAMS_VAL_LOC)
+mlflow.log_param("PARAMS_VAL_SCALE", PARAMS_VAL_SCALE)
+mlflow.log_param("PARAMS_DEV", PARAMS_DEV)
+mlflow.log_param("NOISE_LEV", NOISE_LEV)
+mlflow.log_param("CHAIN_LENGTH", CHAIN_LENGTH)
+mlflow.log_param("TUNE", TUNE)
+mlflow.log_param("TARGET_ACCEPTANCE", TARGET_ACCEPTANCE)
+mlflow.log_param("N_SAMPLES_POSTERIOR", N_SAMPLES_POSTERIOR)
+mlflow.log_param("HOLD_OUT_CUTOFF", HOLD_OUT_CUTOFF)
+mlflow.log_param("EXCLUDE_PERIOD_START", EXCLUDE_PERIOD_START)
+mlflow.log_param("EXCLUDE_PERIOD_STOP", EXCLUDE_PERIOD_STOP)
+mlflow.log_param("USE_DUMMY_COVID_PREDICTOR", USE_DUMMY_COVID_PREDICTOR)
+mlflow.log_param("MEV_BASE_FILE", MEV_BASE_FILE)
+mlflow.log_param("DROPOUT_RATE", DROPOUT_RATE)
+mlflow.log_param("TRAIN_PERIOD_START", TRAIN_PERIOD_START)
+mlflow.log_param("HELPER_SCENARIOS", HELPER_SCENARIOS)
+mlflow.log_param("CORRELATION_THRESHOLD", CORRELATION_THRESHOLD)
+mlflow.log_param("SEED", SEED) 
+# % }}}1
+
+# % PCA
+mev_raw = pd.read_parquet(cf.PROCESSED_DATA_DIR + MEV_BASE_FILE + ".parquet")
+#mev_raw = pd.read_csv(cf.PROCESSED_DATA_DIR + MEV_BASE_FILE + ".csv", parse_dates=True, index_col=0)
+mev_raw = mev_raw.loc[mev_raw.index > PCA_PERIOD_START]
+mev_raw = mev_raw.pct_change(cf.CI_PCT_CHANGE_PERIOD).dropna()
+scaler = StandardScaler()
+n_factors = len(mev_raw.columns)  # setting number of factors as the number of input variables
+fa = FactorAnalyzer(n_factors=n_factors, rotation='varimax')
+pca_pl = Pipeline([("scaler", scaler), ("pca", fa)])
+pca_pl.fit(mev_raw)
+mev_pca = mev_pca_transform(mev_raw, pca_pl)
+
+joblib.dump(pca_pl, ARTIFACTS_DIR + "pca_pl")
+pca_summary = pd.DataFrame(pca_pl["pca"].get_factor_variance(), index=['Variance', 'Proportional Var', 'Cumulative Var'])
+pca_communalities = pd.DataFrame(pca_pl["pca"].get_communalities(), index=mev_raw.columns, columns=['Communalities'])
+pca_summary.to_csv(ARTIFACTS_DIR + "pca_summary.csv")
+pca_communalities.to_csv(ARTIFACTS_DIR + "pca_communalities.csv")
+# %
+
+# +
+# # % load data
+# if DATA_TYPE == "ci":
+#     log.info("using ci...")
+#     df1 = pd.read_parquet(cf.PROCESSED_DATA_DIR + "ci_history.parquet").dropna(axis=1, how="all").replace([-np.inf, np.inf], np.nan)
+#     df2 = pd.read_parquet(cf.PROCESSED_DATA_DIR + "ci_forecast.parquet").dropna(axis=1, how="all").replace([-np.inf, np.inf], np.nan)
+#     df1 = df1.iloc[:-1]
+# elif DATA_TYPE == "cre_vacancy":
+#     log.info("using cre_vacancy...")
+#     df1 = pd.read_parquet(cf.PROCESSED_DATA_DIR + "cre_history_vacancy.parquet").dropna(axis=1, how="all").replace([-np.inf, np.inf], np.nan)
+#     df2 = pd.read_parquet(cf.PROCESSED_DATA_DIR + "cre_forecast_vacancy.parquet").dropna(axis=1, how="all").replace([-np.inf, np.inf], np.nan)
+#     #df1 = df1.iloc[:-1]
+#     #df2 = df2.iloc[5:]
+# elif DATA_TYPE == "cre_asking_rent":
+#     log.info("using cre asking rent...")
+#     df1 = pd.read_parquet(cf.PROCESSED_DATA_DIR + "cre_history_asking_rent.parquet").dropna(axis=1, how="all").replace([-np.inf, np.inf], np.nan)
+#     df2 = pd.read_parquet(cf.PROCESSED_DATA_DIR + "cre_forecast_asking_rent.parquet").dropna(axis=1, how="all").replace([-np.inf, np.inf], np.nan)
+#     #df1 = pd.read_parquet(cf.PROCESSED_DATA_DIR + "cre_history_asking_rent.parquet").pct_change(cf.CRE_PCT_CHANGE_PERIOD).dropna(axis=1, how="all").replace([-np.inf, np.inf], np.nan)
+#     #df2 = pd.read_parquet(cf.PROCESSED_DATA_DIR + "cre_forecast_asking_rent.parquet").pct_change(cf.CRE_PCT_CHANGE_PERIOD).dropna(axis=1, how="all").replace([-np.inf, np.inf], np.nan)
+#     #df1 = df1.iloc[:-1]
+#     #df2 = df2.dropna()
+# elif DATA_TYPE == "cre_12M_Rolling_Cap_Rate":
+#     log.info("using cre_12M_Rolling_Cap_Rate...")
+#     df1 = pd.read_parquet(cf.PROCESSED_DATA_DIR + "cre_history_12M_Rolling_Cap_Rate.parquet").dropna(axis=1, how="all").replace([-np.inf, np.inf], np.nan)
+#     df2 = pd.read_parquet(cf.PROCESSED_DATA_DIR + "cre_forecast_12M_Rolling_Cap_Rate.parquet").dropna(axis=1, how="all").replace([-np.inf, np.inf], np.nan)
+#     #df1 = df1.iloc[:-1]
+#     #df2 = df2.iloc[4:]
+# elif DATA_TYPE == "cre_Med_Sale_Price":
+#     log.info("using cre_Med_Sale_Price...")
+#     df1 = pd.read_parquet(cf.PROCESSED_DATA_DIR + "cre_history_Med_Sale_Price.parquet").dropna(axis=1, how="all").replace([-np.inf, np.inf], np.nan)
+#     df2 = pd.read_parquet(cf.PROCESSED_DATA_DIR + "cre_forecast_Med_Sale_Price.parquet").dropna(axis=1, how="all").replace([-np.inf, np.inf], np.nan)
+#     #df1 = pd.read_parquet(cf.PROCESSED_DATA_DIR + "cre_history_Med_Sale_Price.parquet").pct_change(cf.CRE_PCT_CHANGE_PERIOD).dropna(axis=1, how="all").replace([-np.inf, np.inf], np.nan)
+#     #df2 = pd.read_parquet(cf.PROCESSED_DATA_DIR + "cre_forecast_Med_Sale_Price.parquet").pct_change(cf.CRE_PCT_CHANGE_PERIOD).dropna(axis=1, how="all").replace([-np.inf, np.inf], np.nan)
+#     #df1 = df1.iloc[:-1]
+#     #df2 = df2.dropna()
+# # %
+
+# +
+# # Following remove first 5 periods from forecast - 2020-Q1 to 2021-Q1
+# #df2 = df2.iloc[5:]
+# # % apply filter
+# if PERIOD == "history":
+#     df = df1
+# elif PERIOD == "forecast":
+#     df = df2
+# else:
+#     df = pd.concat((df1, df2))
+# df = df.fillna(cf.NULL_IMPUTATION)
+
+# +
+# # % load data
+# if DATA_TYPE == "cre_asking_rent" or DATA_TYPE == "cre_Med_Sale_Price":
+#     df = df.pct_change(cf.CRE_PCT_CHANGE_PERIOD).dropna(axis=1, how="all").replace([-np.inf, np.inf], np.nan)
+# # %
+# #df = df.dropna()
+
+# +
+# # Code to filter data based on property type
+# if not DATA_TYPE == "ci":
+#     sub_set_property_columns = []
+#     for property_string in list(map(str.lower,PROPERTY_TYPE)):
+#         sub_set_property_columns.extend(df.columns[df.columns.str.contains(property_string)].values)
+
+#     df = df[sub_set_property_columns]
+# -
+
+#df = df.dropna()
+df = return_processed_data(DATA_TYPE=DATA_TYPE, PROPERTY_TYPE=PROPERTY_TYPE, PERIOD=PERIOD)
+
+# +
+# df1 = pd.read_parquet(cf.PROCESSED_DATA_DIR + "ci_history.parquet").dropna(axis=1, how="all").replace([-np.inf, np.inf], np.nan)
+# df2 = pd.read_parquet(cf.PROCESSED_DATA_DIR + "ci_forecast.parquet").dropna(axis=1, how="all").replace([-np.inf, np.inf], np.nan)
+# df = pd.concat((df1, df2))
+
+# +
+#df.dropna().to_csv('ci cluster 0 post dropna.csv')
+
+# +
+#log.info(df.head())
+# -
+
+# % load relevant cluster
+cluster_path = cf.MLFLOW_TRACKING_DIR + f"{CLUSTER_EXPERIMENT_ID}/{CLUSTER_RUN_ID}/artifacts/clusters.csv"
+clusters = pd.read_csv(cluster_path)
+clusters.to_csv(ARTIFACTS_DIR + "clusters.csv")  # save in artifacts for convenience
+# %
+# -
+
+cluster_path
+
+# % prepare datasets for hbm modelling
+df, predictors = prepare_dataset(df, mev_pca, clusters, CLUSTER_ID, N_PCA_FACTORS, USE_DUMMY_COVID_PREDICTOR, HELPER_SCENARIOS, CORRELATION_THRESHOLD)
+n_predictors = len(predictors)
+df["scenario"].unique()
+
+df
+
+scenario_id_mapping = df[["scenario", "scenario_id"]].drop_duplicates().set_index("scenario")
+scenario_id_mapping.to_csv(ARTIFACTS_DIR + "scenario_id_mapping.csv")
+# %
+
+# % split train/test
+df_train = df[(df.period >= TRAIN_PERIOD_START) & (df.period < HOLD_OUT_CUTOFF) & ((df.period < EXCLUDE_PERIOD_START) | (df.period > EXCLUDE_PERIOD_STOP))]
+if DROPOUT_RATE > 0:
+    df_train = df_train.sample(frac=1 - DROPOUT_RATE).sort_values(by="period")
+df_test = df[df.period >= HOLD_OUT_CUTOFF]
+# %
+
+df_train
+
+# % get scenario list
+scenario_ids = df["scenario_id"].values
+scenario_ids_train = df_train["scenario_id"].values
+scenario_ids_test = df_test["scenario_id"].values
+n_scenarios = len(set(scenario_ids_train))
+for col in ["target", *predictors]:
+    df[col] = df[col].astype(theano.config.floatX)
+    # %
+
+# % OLS (perform on full dataset, no train-test split)
+lm = sm.OLS(df["target"], df[["cst", *predictors]])
+res = lm.fit()
+res.summary()
+with open(ARTIFACTS_DIR + 'summary.txt', 'w') as fh:
+    fh.write(res.summary().as_text())
+
+lm = sm.OLS(df["target"], df[["cst", *predictors]])
+res = lm.fit()
+
+fig, ax1 = plt.subplots()
+ax1.scatter(df["target"], res.predict(df[["cst", *predictors]]))
+ax1.set_ylabel("predicted")
+ax1.set_xlabel("observed")
+ax1.set_title("OLS")
+ax1.grid()
+plt.show(block=False)
+fig.savefig(ARTIFACTS_DIR + "OLS_obs_vs_pred_scatter.png")
+# %
+
+df_train
+
+# % train the model 
+with model_factory(df_train, scenario_ids_train, n_predictors, PARAMS_VAL_LOC, PARAMS_VAL_SCALE, PARAMS_DEV, NOISE_LEV, n_scenarios):
+    hierarchical_trace = pm.sample(CHAIN_LENGTH, tune=TUNE, target_accept=TARGET_ACCEPTANCE, cores=CORES, random_seed=SEED)
+    #hierarchical_trace = pm.sample(CHAIN_LENGTH, tune=TUNE, target_accept=TARGET_ACCEPTANCE, cores=CORES)
+trace_summary = az.summary(hierarchical_trace)
+trace_summary.to_csv(ARTIFACTS_DIR + "trace_summary.csv")
+pm.save_trace(hierarchical_trace, ARTIFACTS_DIR + "pymc_trace")
+    # %
+
+# %
+# make predictions (both for train and test)
+# %
+# make point estimates prediction
+pred_train = point_estimates_inference(df_train, predictors, n_scenarios, trace_summary, where="mean")
+pred_test = point_estimates_inference(df_test, predictors, n_scenarios, trace_summary, where="mean")
+# add predictions to the initial dataframes
+df_train = pd.merge(df_train, pred_train, on=["period", "scenario"])
+df_test = pd.merge(df_test, pred_test, on=["period", "scenario"])
+# %
+
+# +
+#trace_df.to_csv(ARTIFACTS_DIR + "trained_trace.csv")
+# %
+# -
+
+#
+# DIAGNOSTICS
+
+# %
+ax = pm.plot_trace(hierarchical_trace, ["mu_" + char for char in "abcde"])
+plt.show(block=False)
+plt.savefig(ARTIFACTS_DIR + "mus.png")
+az.plot_forest(hierarchical_trace, var_names="b", r_hat=True, combined=True, textsize=8)
+plt.show(block=False)
+plt.savefig(ARTIFACTS_DIR + "b_scenario_level.png")
+# %
+
+# %
+for data, split in (df_train, "train"), (df_test, "test"):
+    for scorer in r2_score, mean_squared_error, mean_absolute_error:
+        #score = scorer(data.target.values, y_pred_mean)
+        score = scorer(data.dropna()['target'].values, data.dropna()['pred_mean'].values)
+        mlflow.log_metric(f"{scorer.__name__} {split}", score)
+df_train.to_csv(ARTIFACTS_DIR + "df_train.csv")
+df_test.to_csv(ARTIFACTS_DIR + "df_test.csv")
+# %
+
+# %
+fig, (ax1, ax2) = plt.subplots(1, 2)
+fig.set_size_inches([10.4, 4.8])
+for data, split, ax in (df_train, "train", ax1), (df_test, "test", ax2):
+    ax.scatter(data.target.values, data.pred_mean.values)
+    ax.set_xlabel("observed")
+    ax.set_ylabel("predicted")
+    ax.set_title(f"HBM {split}")
+    ax.grid()
+fig.savefig(ARTIFACTS_DIR + "HBM_obs_vs_pred_scatter.png")
+plt.show(block=False)
+# %
+
+# %
+scenario_name_list = []
+test_score_list = []
+train_score_list = []
+rmse_df = pd.DataFrame()
+for iid in range(n_scenarios): 
+    scenario_name = df.loc[df.scenario_id == iid, "scenario"].unique()[0].replace("/", "_")
+    scenario_name = scenario_name.replace(';', '')
+    scenario_name_list.append(scenario_name)
+    fig, ax1 = plt.subplots()
+    y_true = df.loc[df.scenario_id == iid, "target"].values
+    periods_true = df.loc[df.scenario_id == iid, "period"].values
+    for data, split, sids, color in (df_train, "train", scenario_ids_train, "black"), (df_test, "test", scenario_ids_test, "red"):
+        y_pred = data[data.scenario_id == iid]["pred_mean"]
+        periods = data.loc[data.scenario_id == iid, "period"].values
+        ax1.plot(periods, y_pred, label=f"predicted {split}", color=color)
+        # Lines added by Gaurav to store RMSE at each scenario level
+        if split == 'test':
+            score = mean_squared_error(data[data.scenario_id == iid]["target"].values, y_pred)
+            test_score_list.append(score)
+        elif split == 'train':
+            train_target_data = df.loc[((df.period<=BEF_COVID_PERIOD_END) & (df.scenario_id == iid)), "target"].values
+            temp_df = pd.DataFrame()
+            temp_df.index = df.loc[((df.period<=BEF_COVID_PERIOD_END) & (df.scenario_id == iid)), "period"]
+            temp_df['true'] = train_target_data
+            temp_df = pd.merge(temp_df, data[data.scenario_id == iid].set_index("period")["pred_mean"], left_index=True, right_index=True)
+            temp_df = temp_df.dropna()
+            score = mean_squared_error(temp_df['true'].values, temp_df['pred_mean'].values)
+            train_score_list.append(score)
+        mlflow.log_metric(f"{mean_squared_error.__name__} {split} {scenario_name}", score)
+    ax1.plot(periods_true, y_true, label="observed")
+    ax1.set_ylabel("YoY change")
+    ax1.set_xlabel("period")
+    ax1.legend()
+    ax1.set_title(scenario_name)
+    ax1.grid()
+    plt.show(block=False)
+    fig.savefig(ARTIFACTS_DIR + f"{scenario_name}_obs_pred_ts.png")
+    # %
+
+# + endofcell="--"
+# # +
+temp_dict = dict()
+temp_dict['scenario_name'] = scenario_name_list
+temp_dict['train'] = train_score_list
+temp_dict['test'] = test_score_list
+
+rmse_df = pd.DataFrame(temp_dict)
+rmse_df.to_csv(ARTIFACTS_DIR + "rmse_train_test_scores.csv")
+# -
+# --
+
+# %
+mlruns_artifact_dir = get_mlruns_artifact_dir(run)
+dir_util.copy_tree(src=ARTIFACTS_DIR, dst=mlruns_artifact_dir, verbose=1, preserve_symlinks=1)
+mlflow.end_run()
+log.info("done")
+log.info("*********")
+# %
+
+rmse_df.sort_values(by='train', ascending=False)
+
+rmse_df.sort_values(by='test', ascending=False)
+
+#from mlflow.tracking.client import MlflowClient
+#from mlflow.entities import ViewType
+#query = "params.CLUSTER_ID = '9'"
+#run = MlflowClient().search_runs(
+#  experiment_ids="2",
+#  filter_string=query,
+#  run_view_type=ViewType.ACTIVE_ONLY,
+#  max_results=100,
+  #order_by=["parameter.cluster_id DESC"]
+#)
+
+# +
+#run[1]
+# -
+
+

@@ -28,19 +28,19 @@ import joblib
 # % arguments parsing {{{1
 parser = argparse.ArgumentParser(description="hbm model")
 parser.add_argument('-p', '--period', help="forecast, history or all", default="all", type=str, choices=["forecast", "history", "both"])
-parser.add_argument('-x', '--experiment-name', help="mlflow experiment name", default="ci cluster 0 5000 hbm model", type=str)
-parser.add_argument('-X', '--cluster-experiment-id', help="experiment id used to store the cluster model", default="56", type=str)
-parser.add_argument('-R', '--cluster-run-id', help="run id used to store the cluster model", default="b681e71f3a4346468fb3759ceb5bc6b8", type=str)
+parser.add_argument('-x', '--experiment-name', help="mlflow experiment name", default="ci cluster 0 ON Stress Case 9 Nov V1 hbm model", type=str)
+parser.add_argument('-X', '--cluster-experiment-id', help="experiment id used to store the cluster model", default="91", type=str)
+parser.add_argument('-R', '--cluster-run-id', help="run id used to store the cluster model", default="347b0629a49a4bf080971e2a2bcfdcff", type=str)
 parser.add_argument('-dt', '--data-type', help="run cluster on ci or cre data", default="ci", choices=["ci", "cre_asking_rent", "cre_vacancy", "cre_12M_Rolling_Cap_Rate", "cre_Med_Sale_Price"])
-parser.add_argument('-pt', '--property-type', help="run cluster on selected property types", default="Multifamily,Office,Retail", type=str)
+parser.add_argument('-pt', '--property-type', help="run cluster on selected property types", default=None, type=str)
 parser.add_argument('-i', '--cluster-id', help="cluster id", default=0, type=int)
 parser.add_argument('-n', '--n-pca-factors', help="number of factors to use", default=12, type=int, choices=range(1, 14))
-parser.add_argument('-l', '--chain-length', help="size of the sampling chain", default=5000, type=int)
-parser.add_argument('-L', '--posterior-chain-length', help="size of the posterior chain", default=5000, type=int)
-parser.add_argument('-t', '--tune', help="size of the burning period", default=5000, type=int)
-#parser.add_argument('-e', "--exclude-period", help="dont train the model on this period. The input shall take the form yyyy-mm-dd:yyyy-mm-dd", default="2019-01-01:2022-01-01", type=str)
+parser.add_argument('-l', '--chain-length', help="size of the sampling chain", default=2000, type=int)
+parser.add_argument('-L', '--posterior-chain-length', help="size of the posterior chain", default=2000, type=int)
+parser.add_argument('-t', '--tune', help="size of the burning period", default=2000, type=int)
+#parser.add_argument('-e', "--exclude-period", help="dont train the model on this period. The input shall take the form yyyy-mm-dd:yyyy-mm-dd", default="2020-01-01:2022-01-01", type=str)
 parser.add_argument('-e', "--exclude-period", help="dont train the model on this period. The input shall take the form yyyy-mm-dd:yyyy-mm-dd", default=None, type=str)
-parser.add_argument('-c', "--cores", help="number of cores to use", default=2, type=int)
+parser.add_argument('-c', "--cores", help="number of cores to use", default=4, type=int)
 parser.add_argument('-v', "--use-dummy-covid-predictor", help="use extra predictor taking value 1 during covid (2020-01-01:2022-01-01), 0 otherwise", default=0, type=int)
 parser.add_argument('-m', "--mev-base-file", help="file containing the base macroeconomic condition", default="economic_indicators_210507", type=str)
 #parser.add_argument('-m', "--mev-base-file", help="file containing the base macroeconomic condition", default="economic_indicators_agg_model", type=str)
@@ -56,7 +56,9 @@ args, unknown = parser.parse_known_args()
 # % PARAMETERS {{{1
 EXPERIMENT_NAME = args.experiment_name
 DATA_TYPE = args.data_type
-PROPERTY_TYPE = args.property_type.split(",")
+PROPERTY_TYPE = args.property_type
+if PROPERTY_TYPE is not None:
+    PROPERTY_TYPE = args.property_type.split(",")
 PCA_PERIOD_START = "2010-10-01"
 PCA_TYPE = "yoy_change"
 PERIOD = args.period
@@ -428,5 +430,6 @@ rmse_df.sort_values(by='train', ascending=False)
   #order_by=["parameter.cluster_id DESC"]
 #)
 
-# +
-#run[1]
+df.to_csv('CI cluster 0 stress case data check.csv')
+
+

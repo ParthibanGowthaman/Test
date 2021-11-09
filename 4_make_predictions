@@ -1,0 +1,306 @@
+# %
+from factor_analyzer import FactorAnalyzer
+import pdb
+import arviz as az
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import pymc3 as pm
+import theano
+import src.utils.config as cf
+import statsmodels.api as sm
+import mlflow
+import namesgenerator
+import src.utils.io as io
+from loguru import logger as log
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import r2_score, mean_squared_error, mean_absolute_error
+import argparse
+from typing import Any
+from src.models.hbm import model_factory, prepare_dataset, mev_pca_transform, load_pca_pl, point_estimates_inference
+import distutils.dir_util as dir_util
+from src.utils.utils import get_mlruns_artifact_dir
+from src.utils.utils import return_processed_data
+import joblib
+# %
+
+# % arguments parsing
+parser = argparse.ArgumentParser(description="ci hbm predictions")
+parser.add_argument('-p', '--period', help="forecast, history or all", default="all", type=str, choices=["forecast", "history", "both"])
+parser.add_argument('-dt', '--data-type', help="make predictions on ci or cre data", default="ci")
+parser.add_argument('-pt', '--property-type', help="run cluster on selected property types", default=["Multifamily", "Office", "Retail"], type=list)
+parser.add_argument('-x', '--experiment-name', help="mlflow experiment name", default="ci cluster 0 point predictions 28 Oct", type=str)
+parser.add_argument('-X', '--training-experiment-id', help="experiment id used to store the trained model", default="102", type=str)
+parser.add_argument('-R', '--training-run-id', help="run id used to store the trained model", default="70832322e8c645c3b8541da9960a7838", type=str)
+parser.add_argument('-m', "--mev-base-file", help="file containing the base macroeconomic condition", default="economic_indicators_210507", type=str)
+#parser.add_argument('-m', "--mev-base-file", help="file containing the base macroeconomic condition", default="economic_indicators_agg_model", type=str)
+parser.add_argument('-P', "--mev-perturbed-file", help="file containing the perturbed macroeconomic condition", default="economic_indicators_210810", type=str)
+#parser.add_argument('-P', "--mev-perturbed-file", help="file containing the perturbed macroeconomic condition", default="economic_indicators_agg_model", type=str)
+parser.add_argument('-L', '--posterior-chain-length', help="size of the posterior chain", default=2000, type=int)
+parser.add_argument('-s', '--seed', help='seed', default=42, type=int)
+parser.add_argument('-S', '--sensitivity', help='SENSITIVITY', default=0, type=int)
+parser.add_argument('-nl', '--noise-level', help='NOISE_LEVEL', default=0.75, type=float)
+parser.add_argument('-pred', '--predictors', help="predictors", default=["gdp__real__lcu"], type=list)
+args, unknown = parser.parse_known_args()
+# %
+
+# +
+# % load required artifacts
+DATA_TYPE = args.data_type
+PROPERTY_TYPE = args.property_type
+TRAINING_EXPERIMENT_ID = args.training_experiment_id
+TRAINING_RUN_ID = args.training_run_id
+TRAINING_ARTIFACTS_DIR = cf.MLFLOW_TRACKING_DIR + f"{TRAINING_EXPERIMENT_ID}/{TRAINING_RUN_ID}/artifacts/"
+MEV_BASE_FILE = args.mev_base_file
+MEV_PERTURBED_FILE = args.mev_perturbed_file
+N_SAMPLES_POSTERIOR = args.posterior_chain_length
+SEED = args.seed
+PERIOD = args.period
+
+SENSITIVITY = args.sensitivity
+NOISE_LEVEL = args.noise_level
+PREDICTORS = args.predictors
+
+#SENSITIVITY = True # set to True if HB Runs is used for sensitivity analysis
+#NOISE_LEVEL = 75/100 # set noise level for sensitivity run
+#PREDICTORS = ["gdp__real__lcu"] # choose predictors to perturb 
+
+# %
+# -
+
+# % mlflow setup
+mlflow.set_tracking_uri(cf.MLFLOW_TRACKING_DIR)
+mlflow.set_experiment(args.experiment_name)
+RUN_NAME = namesgenerator.get_random_name()
+RELATIVE_RUN_DIR = f"outputs/hbm/{DATA_TYPE}/{RUN_NAME}/"
+LOCAL_RUN_DIR = cf.PROJECT_DIR + RELATIVE_RUN_DIR
+io.create_dir_if_not_exist(LOCAL_RUN_DIR)
+ARTIFACTS_DIR = LOCAL_RUN_DIR
+mlflow.start_run(run_name=RUN_NAME)
+run = mlflow.active_run()
+log.info(f"Active mlflow {RUN_NAME} run_id: {run.info.run_id}")
+# %
+
+# % log input params
+mlflow.log_param("DATA_TYPE", DATA_TYPE) 
+mlflow.log_param("TRAINING_EXPERIMENT_ID", TRAINING_EXPERIMENT_ID) 
+mlflow.log_param("TRAINING_RUN_ID", TRAINING_RUN_ID) 
+mlflow.log_param("MEV_BASE_FILE", MEV_BASE_FILE) 
+mlflow.log_param("MEV_PERTURBED_FILE", MEV_PERTURBED_FILE) 
+mlflow.log_param("N_SAMPLES_POSTERIOR", N_SAMPLES_POSTERIOR) 
+mlflow.log_param("SEED", SEED)
+mlflow.log_param("SENSITIVITY", SENSITIVITY)
+mlflow.log_param("NOISE_LEVEL", NOISE_LEVEL)
+mlflow.log_param("PREDICTORS", PREDICTORS)
+# %
+
+TRAINING_ARTIFACTS_DIR
+
+# 
+pca_pl = load_pca_pl(TRAINING_ARTIFACTS_DIR + "pca_pl")
+#trained_trace = pd.read_csv(TRAINING_ARTIFACTS_DIR + "trained_trace.csv")
+
+runs = mlflow.search_runs(experiment_ids=[TRAINING_EXPERIMENT_ID])
+myrun = runs[runs.run_id == TRAINING_RUN_ID]
+cluster_id = int(myrun["params.CLUSTER_ID"].iloc[0])
+n_pca_factors = int(myrun["params.N_PCA_FACTORS"].iloc[0])
+use_dummy_covid_predictor = int(myrun["params.USE_DUMMY_COVID_PREDICTOR"].iloc[0])
+hbm_params = []
+helper_scenarios = int(myrun["params.HELPER_SCENARIOS"].iloc[0])
+#helper_scenarios = False if myrun["params.HELPER_SCENARIOS"].iloc[0]=='False' else True
+cor_threshold = float(myrun["params.CORRELATION_THRESHOLD"].iloc[0])
+for param in "PARAMS_VAL_LOC", "PARAMS_VAL_SCALE", "PARAMS_DEV", "NOISE_LEV":
+    hbm_params.append(int(myrun[f"params.{param}"].iloc[0]))
+# %
+
+# % also log train model parameters for convenience, we register param as lower case to avoid confusion with input parameters
+for val in "N_PCA_FACTORS", "CLUSTER_ID", "USE_DUMMY_COVID_PREDICTOR":
+    mlflow.log_param(val.lower(), myrun[f"params.{val}"].iloc[0]) 
+# %
+
+# +
+# # % load data
+# if DATA_TYPE == "ci":
+#     log.info("using ci...")
+#     df1 = pd.read_parquet(cf.PROCESSED_DATA_DIR + "ci_history.parquet").dropna(axis=1, how="all").replace([-np.inf, np.inf], np.nan)
+#     df2 = pd.read_parquet(cf.PROCESSED_DATA_DIR + "ci_forecast.parquet").dropna(axis=1, how="all").replace([-np.inf, np.inf], np.nan)
+#     df1 = df1.iloc[:-1]
+# elif DATA_TYPE == "cre_vacancy":
+#     log.info("using cre_vacancy...")
+#     df1 = pd.read_parquet(cf.PROCESSED_DATA_DIR + "cre_history_vacancy.parquet").dropna(axis=1, how="all").replace([-np.inf, np.inf], np.nan)
+#     df2 = pd.read_parquet(cf.PROCESSED_DATA_DIR + "cre_forecast_vacancy.parquet").dropna(axis=1, how="all").replace([-np.inf, np.inf], np.nan)
+#     #df1 = df1.iloc[:-1]
+#     #df2 = df2.iloc[5:]
+# elif DATA_TYPE == "cre_asking_rent":
+#     log.info("using cre asking rent...")
+#     df1 = pd.read_parquet(cf.PROCESSED_DATA_DIR + "cre_history_asking_rent.parquet").dropna(axis=1, how="all").replace([-np.inf, np.inf], np.nan)
+#     df2 = pd.read_parquet(cf.PROCESSED_DATA_DIR + "cre_forecast_asking_rent.parquet").dropna(axis=1, how="all").replace([-np.inf, np.inf], np.nan)
+#     #df1 = pd.read_parquet(cf.PROCESSED_DATA_DIR + "cre_history_asking_rent.parquet").pct_change(cf.CRE_PCT_CHANGE_PERIOD).dropna(axis=1, how="all").replace([-np.inf, np.inf], np.nan)
+#     #df2 = pd.read_parquet(cf.PROCESSED_DATA_DIR + "cre_forecast_asking_rent.parquet").pct_change(cf.CRE_PCT_CHANGE_PERIOD).dropna(axis=1, how="all").replace([-np.inf, np.inf], np.nan)
+#     #df1 = df1.iloc[:-1]
+#     #df2 = df2.dropna()
+# elif DATA_TYPE == "cre_12M_Rolling_Cap_Rate":
+#     log.info("using cre_12M_Rolling_Cap_Rate...")
+#     df1 = pd.read_parquet(cf.PROCESSED_DATA_DIR + "cre_history_12M_Rolling_Cap_Rate.parquet").dropna(axis=1, how="all").replace([-np.inf, np.inf], np.nan)
+#     df2 = pd.read_parquet(cf.PROCESSED_DATA_DIR + "cre_forecast_12M_Rolling_Cap_Rate.parquet").dropna(axis=1, how="all").replace([-np.inf, np.inf], np.nan)
+#     #df1 = df1.iloc[:-1]
+#     #df2 = df2.iloc[4:]
+# elif DATA_TYPE == "cre_Med_Sale_Price":
+#     log.info("using cre_Med_Sale_Price...")
+#     df1 = pd.read_parquet(cf.PROCESSED_DATA_DIR + "cre_history_Med_Sale_Price.parquet").dropna(axis=1, how="all").replace([-np.inf, np.inf], np.nan)
+#     df2 = pd.read_parquet(cf.PROCESSED_DATA_DIR + "cre_forecast_Med_Sale_Price.parquet").dropna(axis=1, how="all").replace([-np.inf, np.inf], np.nan)
+#     #df1 = pd.read_parquet(cf.PROCESSED_DATA_DIR + "cre_history_Med_Sale_Price.parquet").pct_change(cf.CRE_PCT_CHANGE_PERIOD).dropna(axis=1, how="all").replace([-np.inf, np.inf], np.nan)
+#     #df2 = pd.read_parquet(cf.PROCESSED_DATA_DIR + "cre_forecast_Med_Sale_Price.parquet").pct_change(cf.CRE_PCT_CHANGE_PERIOD).dropna(axis=1, how="all").replace([-np.inf, np.inf], np.nan)
+#     #df1 = df1.iloc[:-1]
+#     #df2 = df2.dropna()
+# # %
+
+# +
+# # Following remove first 5 periods from forecast - 2020-Q1 to 2021-Q1
+# #df2 = df2.iloc[5:]
+
+# df = pd.concat((df1, df2))
+# df = df.fillna(cf.NULL_IMPUTATION)
+
+# +
+# # % load data
+# if DATA_TYPE == "cre_asking_rent" or DATA_TYPE == "cre_Med_Sale_Price":
+#     df = df.pct_change(cf.CRE_PCT_CHANGE_PERIOD).dropna(axis=1, how="all").replace([-np.inf, np.inf], np.nan)
+# # %
+# #df = df.dropna()
+
+# +
+# df = df.dropna()
+# -
+
+df = return_processed_data(DATA_TYPE=DATA_TYPE, PROPERTY_TYPE=PROPERTY_TYPE, PERIOD=PERIOD)
+
+# +
+# df1 = pd.read_parquet(cf.PROCESSED_DATA_DIR + "ci_history.parquet").dropna(axis=1, how="all").replace([-np.inf, np.inf], np.nan)
+# df2 = pd.read_parquet(cf.PROCESSED_DATA_DIR + "ci_forecast.parquet").dropna(axis=1, how="all").replace([-np.inf, np.inf], np.nan)
+# df = pd.concat((df1, df2))
+# -
+
+df
+
+# +
+# cluster_path = cf.MLFLOW_TRACKING_DIR + f"{TRAINING_EXPERIMENT_ID}/{TRAINING_RUN_ID}/artifacts/clusters.csv"
+# clusters = pd.read_csv(cluster_path)
+# clusters.to_csv(ARTIFACTS_DIR + "clusters.csv")  # save in artifacts for convenience
+
+clusters = pd.read_csv(TRAINING_ARTIFACTS_DIR + "clusters.csv")
+trace_summary = pd.read_csv(TRAINING_ARTIFACTS_DIR + "trace_summary.csv", index_col=0)
+clusters.to_csv(ARTIFACTS_DIR + "clusters.csv")  # save in artifacts for convenience
+trace_summary.to_csv(ARTIFACTS_DIR + "trace_summary.csv")  # save in artifacts for convenience
+# -
+
+#mev_base = pd.read_parquet(cf.PROCESSED_DATA_DIR + f"{MEV_BASE_FILE}.parquet")
+mev_base = pd.read_csv(cf.PROCESSED_DATA_DIR + f"{MEV_BASE_FILE}.csv", parse_dates=True, index_col=0)
+mev_base = mev_base.pct_change(cf.CI_PCT_CHANGE_PERIOD).dropna()
+
+if SENSITIVITY:
+    mev_perturbed = mev_base.copy()
+    for col in PREDICTORS:
+        mev_perturbed[col] = mev_perturbed[col].apply(lambda x: x + np.random.normal(0, NOISE_LEVEL * np.abs(x)))
+else:
+    mev_perturbed = pd.read_parquet(cf.PROCESSED_DATA_DIR + f"{MEV_PERTURBED_FILE}.parquet")
+    mev_perturbed = mev_perturbed.pct_change(cf.CI_PCT_CHANGE_PERIOD).dropna()
+
+mev_pca_base = mev_pca_transform(mev_base, pca_pl)
+mev_pca_perturbed = mev_pca_transform(mev_perturbed, pca_pl)
+
+df_base, predictors = prepare_dataset(df, mev_pca_base, clusters, cluster_id, n_pca_factors, use_dummy_covid_predictor, helper_scenarios, cor_threshold)
+df_perturbed, _ = prepare_dataset(df, mev_pca_perturbed, clusters, cluster_id, n_pca_factors, use_dummy_covid_predictor, helper_scenarios, cor_threshold)
+n_predictors = len(predictors)
+n_scenarios = df_base["scenario_id"].nunique()
+# %
+
+df_base
+
+# +
+pred_base = point_estimates_inference(df_base, predictors, n_scenarios, trace_summary, where="mean")
+pred_perturbed = point_estimates_inference(df_perturbed, predictors, n_scenarios, trace_summary, where="mean")
+
+tmp = pd.merge(pred_perturbed, pred_base, suffixes=("_perturbed", "_base"), on=["period", "scenario"]).rename(columns={"pred_mean_perturbed": "perturbed", "pred_mean_base": "base"})
+tmp["deltas"] = tmp["perturbed"] - tmp["base"]
+
+df_base = pd.merge(df_base, tmp, on=["period", "scenario"])
+
+# save deltas
+df_base[["period", "scenario", "target", "deltas", "base", "perturbed"]].to_csv(ARTIFACTS_DIR + "deltas.csv", index=False)
+
+# +
+# # %
+# ppc = dict()
+# with model_factory(df_base, df_base["scenario_id"].values, n_predictors, *hbm_params, n_scenarios):
+#     ppc["base"] = pm.sample_posterior_predictive(trace=trained_trace.to_dict('records'), samples=N_SAMPLES_POSTERIOR, random_seed=SEED)
+
+# +
+# with model_factory(df_perturbed, df_perturbed["scenario_id"].values, n_predictors, *hbm_params, n_scenarios):
+#     ppc["perturbed"] = pm.sample_posterior_predictive(trace=trained_trace.to_dict('records'), samples=N_SAMPLES_POSTERIOR, random_seed=SEED)
+
+# +
+# df_base["deltas"] = np.mean(ppc["perturbed"]["yoy_like"], axis=0) - np.mean(ppc["base"]["yoy_like"], axis=0)
+
+# +
+# df_base['base'] = np.mean(ppc["base"]["yoy_like"], axis=0)
+# df_base['perturbed'] = np.mean(ppc["perturbed"]["yoy_like"], axis=0)
+
+# +
+# # save deltas
+# df_base[["period", "scenario", "target", "deltas", "base", "perturbed"]].to_csv(ARTIFACTS_DIR + "deltas.csv", index=False)
+# # %
+# -
+
+ARTIFACTS_DIR
+
+# DIAGNOSTICS
+# %
+for iid in range(n_scenarios): 
+    scenario_name = df_base.loc[df_base.scenario_id == iid, "scenario"].unique()[0].replace("/", "_")
+    fig, ax1 = plt.subplots()
+    y_base = df_base.loc[df_base.scenario_id == iid, "target"].values
+    y_deltas = y_base + df_base.loc[df_base.scenario_id == iid, "deltas"].values
+    periods = df_base.loc[df_base.scenario_id == iid, "period"].values
+    ax1.plot(periods, y_base, label="base")
+    ax1.plot(periods, y_deltas, label="base + deltas", color="black")
+    ax1.set_ylabel("YoY change")
+    ax1.set_xlabel("period")
+    ax1.legend()
+    ax1.set_title(scenario_name)
+    ax1.grid()
+    plt.show(block=False)
+    fig.savefig(ARTIFACTS_DIR + f"{scenario_name}_perturbed_ts.png")
+    # %
+
+# DIAGNOSTICS
+# %
+for iid in range(n_scenarios): 
+    scenario_name = df_base.loc[df_base.scenario_id == iid, "scenario"].unique()[0].replace("/", "_")
+    fig, ax1 = plt.subplots()
+    y_base = df_base.loc[df_base.scenario_id == iid, "base"].values
+    y_perturbed = df_base.loc[df_base.scenario_id == iid, "perturbed"].values
+    #y_deltas = y_base + df_base.loc[df_base.scenario_id == iid, "deltas"].values
+    periods = df_base.loc[df_base.scenario_id == iid, "period"].values
+    ax1.plot(periods, y_base, label="base")
+    ax1.plot(periods, y_perturbed, label="perturbed", color="black")
+    #ax1.plot(periods, y_deltas, label="base + deltas", color="black")
+    ax1.set_ylabel("YoY change")
+    ax1.set_xlabel("period")
+    ax1.legend()
+    ax1.set_title(scenario_name)
+    ax1.grid()
+    plt.show(block=False)
+    fig.savefig(ARTIFACTS_DIR + f"{scenario_name}_base_vs_perturbed_ts.png")
+    # %
+
+# %
+mlruns_artifact_dir = get_mlruns_artifact_dir(run)
+dir_util.copy_tree(src=ARTIFACTS_DIR, dst=mlruns_artifact_dir, verbose=1, preserve_symlinks=1)
+mlflow.end_run()
+log.info("done")
+log.info("*********")
+# %
+
+

@@ -23,21 +23,22 @@ time_string = now.strftime(format)
 # +
 # % arguments parsing {{{1
 parser = argparse.ArgumentParser(description="hbm model")
-parser.add_argument('-cx', '--experiment-name', help="mlflow experiment name for clustering", default="ci_cluster5_subcluster9", type=str)
-parser.add_argument('-dt', '--data-type', help="run cluster on ci or cre data", default="ci", choices=["ci", "cre_asking_rent", "cre_vacancy", "cre_12M_Rolling_Cap_Rate", "cre_Med_Sale_Price"])
-parser.add_argument('-pt', '--property-type', help="run cluster on selected property types", default="Multifamily,Office,Retail", type=str)
+parser.add_argument('-cx', '--experiment-name', help="mlflow experiment name for clustering", default="cre_12M_Rolling_Cap_Rate", type=str)
+parser.add_argument('-dt', '--data-type', help="run cluster on ci or cre data", default="cre_12M_Rolling_Cap_Rate", choices=["ci", "cre_asking_rent", "cre_vacancy", "cre_12M_Rolling_Cap_Rate", "cre_Med_Sale_Price"])
+parser.add_argument('-pt', '--property-type', help="run cluster on selected property types", default=None, type=str)
 
-parser.add_argument('-X', '--cluster-experiment-id', help="experiment id used to store the cluster model", default="2", type=str)
-parser.add_argument('-R', '--cluster-run-id', help="run id used to store the cluster model", default="33990bb014784eee82e172e5f79984a4", type=str)
+parser.add_argument('-X', '--cluster-experiment-id', help="experiment id used to store the cluster model", default="155", type=str)
+parser.add_argument('-R', '--cluster-run-id', help="run id used to store the cluster model", default="e4271cb43e0a4c7994a64e1b63ee50a0", type=str)
 
-parser.add_argument('-i', '--cluster-id', help="cluster id", default="9", type=str)
+parser.add_argument('-i', '--cluster-id', help="cluster id", default="0", type=str)
 parser.add_argument('-npr', '--n-pca-factors-range', help="range of number of factors to use", default="6,13", type=str)
 parser.add_argument('-clr', '--chain-length-range', help="range of size of the sampling chain", default="2000,5000,10000", type=str)
 parser.add_argument('-epr', "--exclude-period-range", help="dont train the model on this period. The input shall take the form yyyy-mm-dd:yyyy-mm-dd", default="2020-02-01:2021-07-01,2100-01-01:2000-01-01", type=str)
+#parser.add_argument('-epr', "--exclude-period-range", help="dont train the model on this period. The input shall take the form yyyy-mm-dd:yyyy-mm-dd", default="2020-02-01:2022-10-01", type=str)
 
 parser.add_argument('-m', "--mev-base-file", help="file containing the base macroeconomic condition", default="economic_indicators_210507", type=str)
 
-parser.add_argument("-hs", "--helper-scenarios", help="use helper scenarios", default="1", type=str)
+parser.add_argument("-hs", "--helper-scenarios", help="use helper scenarios", default="0", type=str)
 parser.add_argument("-ct", "--correlation-threshold", help="correlation threshold for helper scenario", default="0.8", type=str)
 parser.add_argument("-mnhs", "--min-number-of-helpers", help="Minimum required helper scenarios", default="5", type=str)
 
@@ -131,11 +132,12 @@ mlflow.set_tracking_uri(cf.MLFLOW_TRACKING_DIR)
 
 cluster_experiment_id = CLUSTER_EXPERIMENT_ID
 cluster_run_id = CLUSTER_RUN_ID
-# -
 
-EXPERIMENT_NAME_GRID_SEARCH='ci_clusters_CLUSTER_ID_1_GRID_Search_28_10_2021_11_30_00'
+# +
+#EXPERIMENT_NAME_GRID_SEARCH='ci_clusters_CLUSTER_ID_1_GRID_Search_3_11_2021_11_30_00'
 
-N_PCA_FACTORS_RANGE='9,13'
+# +
+#N_PCA_FACTORS_RANGE='6,8'
 
 # +
 N_PCA_START, N_PCA_STOP = N_PCA_FACTORS_RANGE.split(",")
@@ -148,13 +150,22 @@ for n_pca_factors in range(int(N_PCA_START),int(N_PCA_STOP)+1,1):
         print(chain_length)
         for exclude_period in EXCLUDE_PERIOD_LIST:
             print(exclude_period)
-            call_string = "python /opt/app/src/main/3_train_hbm.py -X " + cluster_experiment_id +\
-            " -R " + cluster_run_id + " -n " + str(n_pca_factors) + " -i " + CLUSTER_ID + " -l " +\
-            str(chain_length) + " -L " + str(chain_length) + " -t " + str(chain_length) +\
-            " -m " + MEV_BASE_FILE + " -hs " + HELPER_SCENARIOS +\
-            " -dt " + DATA_TYPE + " -pt " + str(PROPERTY_TYPE) +\
-            " -ct " + CORRELATION_THRESHOLD + " -e " + exclude_period +\
-            " -x " + EXPERIMENT_NAME_GRID_SEARCH
+            if PROPERTY_TYPE is not None:
+                call_string = "python /opt/app/src/main/3_train_hbm.py -X " + cluster_experiment_id +\
+                " -R " + cluster_run_id + " -n " + str(n_pca_factors) + " -i " + CLUSTER_ID + " -l " +\
+                str(chain_length) + " -L " + str(chain_length) + " -t " + str(chain_length) +\
+                " -m " + MEV_BASE_FILE + " -hs " + HELPER_SCENARIOS +\
+                " -dt " + DATA_TYPE + " -pt " + str(PROPERTY_TYPE) +\
+                " -ct " + CORRELATION_THRESHOLD + " -e " + exclude_period +\
+                " -x " + EXPERIMENT_NAME_GRID_SEARCH
+            else:
+                call_string = "python /opt/app/src/main/3_train_hbm.py -X " + cluster_experiment_id +\
+                " -R " + cluster_run_id + " -n " + str(n_pca_factors) + " -i " + CLUSTER_ID + " -l " +\
+                str(chain_length) + " -L " + str(chain_length) + " -t " + str(chain_length) +\
+                " -m " + MEV_BASE_FILE + " -hs " + HELPER_SCENARIOS +\
+                " -dt " + DATA_TYPE +\
+                " -ct " + CORRELATION_THRESHOLD + " -e " + exclude_period +\
+                " -x " + EXPERIMENT_NAME_GRID_SEARCH
             output = subprocess.check_call(call_string, shell=True)
             if output != 0:
                 exit()
@@ -174,9 +185,9 @@ output = subprocess.check_call(call_string, shell=True)
 if output != 0:
     exit()
 
+# +
 #EXPERIMENT_NAME_MODEL_COMPARISON = 'ci_clusters_CLUSTER_ID_1_Model_Comparison_28_10_2021_18_09_41'
-#EXPERIMENT_NAME_MODEL_COMPARISON = 'ci_cluster5_subcluster9_CLUSTER_ID_9_Model_Comparison_04_11_2021_07_46_51'
-
+# -
 
 experiments = MlflowClient().get_experiment_by_name(EXPERIMENT_NAME_MODEL_COMPARISON)
 runs = MlflowClient().search_runs(experiments.experiment_id,
@@ -192,13 +203,22 @@ EXCLUDE_PERIOD_START = params_dict['EXCLUDE_PERIOD_START']
 EXCLUDE_PERIOD_STOP = params_dict['EXCLUDE_PERIOD_STOP']
 exclude_period = EXCLUDE_PERIOD_START + ':' + EXCLUDE_PERIOD_STOP
 
-call_string = "python /opt/app/src/main/3.5_train_hbm_full.py -X " + cluster_experiment_id +\
-    " -R " + cluster_run_id + " -n " + str(n_pca_factors) + " -i " + CLUSTER_ID + " -l " +\
-    str(chain_length) + " -L " + str(chain_length) + " -t " + str(chain_length) +\
-    " -m " + MEV_BASE_FILE + " -hs " + HELPER_SCENARIOS +\
-    " -dt " + DATA_TYPE + " -pt " + str(PROPERTY_TYPE) +\
-    " -ct " + CORRELATION_THRESHOLD + " -e " + exclude_period +\
-    " -x " + EXPERIMENT_NAME_FINAL_TRAIN
+if PROPERTY_TYPE is not None:
+    call_string = "python /opt/app/src/main/3.5_train_hbm_full.py -X " + cluster_experiment_id +\
+        " -R " + cluster_run_id + " -n " + str(n_pca_factors) + " -i " + CLUSTER_ID + " -l " +\
+        str(chain_length) + " -L " + str(chain_length) + " -t " + str(chain_length) +\
+        " -m " + MEV_BASE_FILE + " -hs " + HELPER_SCENARIOS +\
+        " -dt " + DATA_TYPE + " -pt " + str(PROPERTY_TYPE) +\
+        " -ct " + CORRELATION_THRESHOLD + " -e " + exclude_period +\
+        " -x " + EXPERIMENT_NAME_FINAL_TRAIN
+else:
+    call_string = "python /opt/app/src/main/3.5_train_hbm_full.py -X " + cluster_experiment_id +\
+        " -R " + cluster_run_id + " -n " + str(n_pca_factors) + " -i " + CLUSTER_ID + " -l " +\
+        str(chain_length) + " -L " + str(chain_length) + " -t " + str(chain_length) +\
+        " -m " + MEV_BASE_FILE + " -hs " + HELPER_SCENARIOS +\
+        " -dt " + DATA_TYPE +\
+        " -ct " + CORRELATION_THRESHOLD + " -e " + exclude_period +\
+        " -x " + EXPERIMENT_NAME_FINAL_TRAIN
 output = subprocess.check_call(call_string, shell=True)
 if output != 0:
     exit()
@@ -216,12 +236,20 @@ final_train_experiment_id = runs.to_dictionary()['info']['experiment_id']
 final_train_run_id = runs.to_dictionary()['info']['run_id']
 #final_data_type = runs.to_dictionary()['data']['params']['DATA_TYPE']
 
-call_string = "python /opt/app/src/main/4_make_predictions.py -X " +\
-    final_train_experiment_id + " -R " + final_train_run_id +\
-    " -P " + MEV_PERTURBED_FILE + " -x " + EXPERIMENT_NAME_DELTA +\
-    " -dt " + DATA_TYPE + " -pt " + str(PROPERTY_TYPE) +\
-    " -m " + MEV_BASE_FILE + " -L " + chain_length +\
-    " -S " + str(SENSITIVITY) + " -nl " + str(NOISE_LEVEL) + " -pred " + str(PREDICTORS)
+if PROPERTY_TYPE is not None:
+    call_string = "python /opt/app/src/main/4_make_predictions.py -X " +\
+        final_train_experiment_id + " -R " + final_train_run_id +\
+        " -P " + MEV_PERTURBED_FILE + " -x " + EXPERIMENT_NAME_DELTA +\
+        " -dt " + DATA_TYPE + " -pt " + str(PROPERTY_TYPE) +\
+        " -m " + MEV_BASE_FILE + " -L " + chain_length +\
+        " -S " + str(SENSITIVITY) + " -nl " + str(NOISE_LEVEL) + " -pred " + str(PREDICTORS)
+else:
+    call_string = "python /opt/app/src/main/4_make_predictions.py -X " +\
+        final_train_experiment_id + " -R " + final_train_run_id +\
+        " -P " + MEV_PERTURBED_FILE + " -x " + EXPERIMENT_NAME_DELTA +\
+        " -dt " + DATA_TYPE +\
+        " -m " + MEV_BASE_FILE + " -L " + chain_length +\
+        " -S " + str(SENSITIVITY) + " -nl " + str(NOISE_LEVEL) + " -pred " + str(PREDICTORS)
 output = subprocess.check_call(call_string, shell=True)
 if output != 0:
     exit()

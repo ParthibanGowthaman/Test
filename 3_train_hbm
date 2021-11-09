@@ -28,19 +28,19 @@ import joblib
 # % arguments parsing {{{1
 parser = argparse.ArgumentParser(description="hbm model")
 parser.add_argument('-p', '--period', help="forecast, history or all", default="all", type=str, choices=["forecast", "history", "both"])
-parser.add_argument('-x', '--experiment-name', help="mlflow experiment name", default="ci cluster 7 hbm model 19 Oct 2012 Period", type=str)
-parser.add_argument('-X', '--cluster-experiment-id', help="experiment id used to store the cluster model", default="40", type=str)
-parser.add_argument('-R', '--cluster-run-id', help="run id used to store the cluster model", default="6de34b99a84747c1b5057341bb000940", type=str)
+parser.add_argument('-x', '--experiment-name', help="mlflow experiment name", default="ci cluster 0 hbm model 4 Nov Point Estimate based interval", type=str)
+parser.add_argument('-X', '--cluster-experiment-id', help="experiment id used to store the cluster model", default="91", type=str)
+parser.add_argument('-R', '--cluster-run-id', help="run id used to store the cluster model", default="347b0629a49a4bf080971e2a2bcfdcff", type=str)
 parser.add_argument('-dt', '--data-type', help="run cluster on ci or cre data", default="ci", choices=["ci", "cre_asking_rent", "cre_vacancy", "cre_12M_Rolling_Cap_Rate", "cre_Med_Sale_Price"])
-parser.add_argument('-pt', '--property-type', help="run cluster on selected property types", default="Multifamily,Office,Retail", type=str)
-parser.add_argument('-i', '--cluster-id', help="cluster id", default=7, type=int)
+parser.add_argument('-pt', '--property-type', help="run cluster on selected property types", default=None, type=str)
+parser.add_argument('-i', '--cluster-id', help="cluster id", default=0, type=int)
 parser.add_argument('-n', '--n-pca-factors', help="number of factors to use", default=6, type=int, choices=range(1, 14))
 parser.add_argument('-l', '--chain-length', help="size of the sampling chain", default=2000, type=int)
 parser.add_argument('-L', '--posterior-chain-length', help="size of the posterior chain", default=2000, type=int)
 parser.add_argument('-t', '--tune', help="size of the burning period", default=2000, type=int)
 #parser.add_argument('-e', "--exclude-period", help="dont train the model on this period. The input shall take the form yyyy-mm-dd:yyyy-mm-dd", default="2019-01-01:2022-01-01", type=str)
 parser.add_argument('-e', "--exclude-period", help="dont train the model on this period. The input shall take the form yyyy-mm-dd:yyyy-mm-dd", default=None, type=str)
-parser.add_argument('-c', "--cores", help="number of cores to use", default=2, type=int)
+parser.add_argument('-c', "--cores", help="number of cores to use", default=4, type=int)
 parser.add_argument('-v', "--use-dummy-covid-predictor", help="use extra predictor taking value 1 during covid (2020-01-01:2022-01-01), 0 otherwise", default=0, type=int)
 parser.add_argument('-m', "--mev-base-file", help="file containing the base macroeconomic condition", default="economic_indicators_210507", type=str)
 #parser.add_argument('-m', "--mev-base-file", help="file containing the base macroeconomic condition", default="economic_indicators_agg_model", type=str)
@@ -56,7 +56,9 @@ args, unknown = parser.parse_known_args()
 # % PARAMETERS {{{1
 EXPERIMENT_NAME = args.experiment_name
 DATA_TYPE = args.data_type
-PROPERTY_TYPE = args.property_type.split(",")
+PROPERTY_TYPE = args.property_type
+if PROPERTY_TYPE is not None:
+    PROPERTY_TYPE = args.property_type.split(",")
 PCA_PERIOD_START = "2010-10-01"
 #PCA_PERIOD_START = "1999-10-01"
 PCA_TYPE = "yoy_change"
@@ -360,6 +362,7 @@ scenario_name_list = []
 test_score_list = []
 train_score_list = []
 rmse_df = pd.DataFrame()
+eps = trace_summary.loc["eps"]["mean"]
 for iid in range(n_scenarios): 
     scenario_name = df.loc[df.scenario_id == iid, "scenario"].unique()[0].replace("/", "_")
     scenario_name = scenario_name.replace(';', '')
@@ -371,6 +374,7 @@ for iid in range(n_scenarios):
         y_pred = data[data.scenario_id == iid]["pred_mean"]
         periods = data.loc[data.scenario_id == iid, "period"].values
         ax1.plot(periods, y_pred, label=f"predicted {split}", color=color)
+        ax1.fill_between(periods, y_pred - 2 * eps, y_pred + 2 * eps, color=color, alpha=0.3, label=f"prediction interval {split}")
         # Lines added by Gaurav to store RMSE at each scenario level
         if split == 'test':
             score = mean_squared_error(data[data.scenario_id == iid]["target"].values, y_pred)
@@ -432,6 +436,26 @@ rmse_df.sort_values(by='test', ascending=False)
 
 # +
 #run[1]
-# -
-
-
+# +
+# # %
+# eps_df = pd.DataFrame(columns=['Date', 'Scenario_Name', 'eps+', 'eps-'])
+# eps = trace_summary.loc["eps"]["mean"]
+# for iid in range(n_scenarios): 
+#     scenario_name = df.loc[df.scenario_id == iid, "scenario"].unique()[0].replace("/", "_")
+#     scenario_name = scenario_name.replace(';', '')
+#     y_true = df.loc[df.scenario_id == iid, "target"].values
+#     periods_true = df.loc[df.scenario_id == iid, "period"].values
+#     for data, split, sids, color in (df_train, "train", scenario_ids_train, "black"), (df_test, "test", scenario_ids_test, "red"):
+#         y_pred = data[data.scenario_id == iid]["pred_mean"]
+        
+#         periods = data.loc[data.scenario_id == iid, "period"].values
+#         temp_df = pd.DataFrame(columns=['Date', 'Scenario_Name', 'eps+', 'eps-'])
+#         temp_df['Date'] = periods
+#         temp_df['eps+'] = (y_pred + 2 * eps).values
+#         temp_df['eps-'] = (y_pred - 2 * eps).values
+#         temp_df['Scenario_Name'] = scenario_name
+#         eps_df = eps_df.append(temp_df)
+#         #ax1.plot(periods, y_pred, label=f"predicted {split}", color=color)
+#         #ax1.fill_between(periods, y_pred - 2 * eps, y_pred + 2 * eps, color=color, alpha=0.3, label=f"prediction interval {split}")
+#         # Lines added by Gaurav to store RMSE at each scenario level
+       

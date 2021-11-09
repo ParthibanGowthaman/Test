@@ -29,10 +29,10 @@ import joblib
 parser = argparse.ArgumentParser(description="ci hbm predictions")
 parser.add_argument('-p', '--period', help="forecast, history or all", default="all", type=str, choices=["forecast", "history", "both"])
 parser.add_argument('-dt', '--data-type', help="make predictions on ci or cre data", default="ci")
-parser.add_argument('-pt', '--property-type', help="run cluster on selected property types", default=["Multifamily", "Office", "Retail"], type=list)
-parser.add_argument('-x', '--experiment-name', help="mlflow experiment name", default="ci cluster 0 point predictions 28 Oct", type=str)
-parser.add_argument('-X', '--training-experiment-id', help="experiment id used to store the trained model", default="102", type=str)
-parser.add_argument('-R', '--training-run-id', help="run id used to store the trained model", default="70832322e8c645c3b8541da9960a7838", type=str)
+parser.add_argument('-pt', '--property-type', help="run cluster on selected property types", default=None, type=str)
+parser.add_argument('-x', '--experiment-name', help="mlflow experiment name", default="ci_cluster_0_ON_stress_case_9_Nov_V1", type=str)
+parser.add_argument('-X', '--training-experiment-id', help="experiment id used to store the trained model", default="153", type=str)
+parser.add_argument('-R', '--training-run-id', help="run id used to store the trained model", default="96ce204db4364d23b7dfd69a31850503", type=str)
 parser.add_argument('-m', "--mev-base-file", help="file containing the base macroeconomic condition", default="economic_indicators_210507", type=str)
 #parser.add_argument('-m', "--mev-base-file", help="file containing the base macroeconomic condition", default="economic_indicators_agg_model", type=str)
 parser.add_argument('-P', "--mev-perturbed-file", help="file containing the perturbed macroeconomic condition", default="economic_indicators_210810", type=str)
@@ -40,8 +40,8 @@ parser.add_argument('-P', "--mev-perturbed-file", help="file containing the pert
 parser.add_argument('-L', '--posterior-chain-length', help="size of the posterior chain", default=2000, type=int)
 parser.add_argument('-s', '--seed', help='seed', default=42, type=int)
 parser.add_argument('-S', '--sensitivity', help='SENSITIVITY', default=0, type=int)
-parser.add_argument('-nl', '--noise-level', help='NOISE_LEVEL', default=0.75, type=float)
-parser.add_argument('-pred', '--predictors', help="predictors", default=["gdp__real__lcu"], type=list)
+parser.add_argument('-nl', '--noise-level', help='NOISE_LEVEL', default=0.01, type=float)
+parser.add_argument('-pred', '--predictors', help="predictors", default="consumers\'_expenditure__total__real__lcu", type=str)
 args, unknown = parser.parse_known_args()
 # %
 
@@ -201,8 +201,9 @@ mev_base = mev_base.pct_change(cf.CI_PCT_CHANGE_PERIOD).dropna()
 
 if SENSITIVITY:
     mev_perturbed = mev_base.copy()
-    for col in PREDICTORS:
-        mev_perturbed[col] = mev_perturbed[col].apply(lambda x: x + np.random.normal(0, NOISE_LEVEL * np.abs(x)))
+    #for col in PREDICTORS:
+        #mev_perturbed[col] = mev_perturbed[col].apply(lambda x: x + np.random.normal(0, NOISE_LEVEL * np.abs(x)))
+    mev_perturbed[PREDICTORS] = mev_perturbed[PREDICTORS].apply(lambda x: x + NOISE_LEVEL)
 else:
     mev_perturbed = pd.read_parquet(cf.PROCESSED_DATA_DIR + f"{MEV_PERTURBED_FILE}.parquet")
     mev_perturbed = mev_perturbed.pct_change(cf.CI_PCT_CHANGE_PERIOD).dropna()
@@ -302,5 +303,25 @@ mlflow.end_run()
 log.info("done")
 log.info("*********")
 # %
+
+mev_perturbed['consumers\'_expenditure__total__real__lcu']
+
+mev_perturbed.columns
+
+mev_perturbed_copy = pd.read_parquet(cf.PROCESSED_DATA_DIR + f"{MEV_PERTURBED_FILE}.parquet")
+mev_perturbed_copy = mev_perturbed_copy.pct_change(cf.CI_PCT_CHANGE_PERIOD).dropna()
+
+mev_perturbed.to_csv('MEV perturbed 1% add.csv')
+
+mev_base.to_csv('MEV base.csv')
+
+if SENSITIVITY:
+    print("Inside")
+    #mev_perturbed = mev_base.copy()
+    #for col in PREDICTORS:
+        #mev_perturbed[col] = mev_perturbed[col].apply(lambda x: x + np.random.normal(0, NOISE_LEVEL * np.abs(x)))
+    #mev_perturbed[PREDICTORS] = mev_perturbed[PREDICTORS].apply(lambda x: x + NOISE_LEVEL)
+else:
+    print("Outside")
 
 

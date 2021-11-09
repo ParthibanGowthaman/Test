@@ -1,0 +1,238 @@
+# %
+import subprocess
+import mlflow
+import src.utils.config as cf
+import argparse
+from datetime import datetime
+from mlflow.tracking.client import MlflowClient
+from mlflow.entities import ViewType
+from src.utils.utils import return_processed_data
+from src.models.hbm import get_helpers
+import pandas as pd
+# %
+
+# %
+#current date and time
+now = datetime.now()
+#date and time format: dd/mm/YYYY H:M:S
+format = "%d_%m_%Y_%H_%M_%S"
+#format datetime using strftime() 
+time_string = now.strftime(format)
+# %
+
+# +
+# % arguments parsing {{{1
+parser = argparse.ArgumentParser(description="hbm model")
+parser.add_argument('-cx', '--experiment-name', help="mlflow experiment name for clustering", default="ci_cluster5_subcluster9", type=str)
+parser.add_argument('-dt', '--data-type', help="run cluster on ci or cre data", default="ci", choices=["ci", "cre_asking_rent", "cre_vacancy", "cre_12M_Rolling_Cap_Rate", "cre_Med_Sale_Price"])
+parser.add_argument('-pt', '--property-type', help="run cluster on selected property types", default="Multifamily,Office,Retail", type=str)
+
+parser.add_argument('-X', '--cluster-experiment-id', help="experiment id used to store the cluster model", default="2", type=str)
+parser.add_argument('-R', '--cluster-run-id', help="run id used to store the cluster model", default="33990bb014784eee82e172e5f79984a4", type=str)
+
+parser.add_argument('-i', '--cluster-id', help="cluster id", default="9", type=str)
+parser.add_argument('-npr', '--n-pca-factors-range', help="range of number of factors to use", default="6,13", type=str)
+parser.add_argument('-clr', '--chain-length-range', help="range of size of the sampling chain", default="2000,5000,10000", type=str)
+parser.add_argument('-epr', "--exclude-period-range", help="dont train the model on this period. The input shall take the form yyyy-mm-dd:yyyy-mm-dd", default="2020-02-01:2021-07-01,2100-01-01:2000-01-01", type=str)
+
+parser.add_argument('-m', "--mev-base-file", help="file containing the base macroeconomic condition", default="economic_indicators_210507", type=str)
+
+parser.add_argument("-hs", "--helper-scenarios", help="use helper scenarios", default="1", type=str)
+parser.add_argument("-ct", "--correlation-threshold", help="correlation threshold for helper scenario", default="0.8", type=str)
+parser.add_argument("-mnhs", "--min-number-of-helpers", help="Minimum required helper scenarios", default="5", type=str)
+
+parser.add_argument('-th', "--mse-threshold", help="filter out models above rmse-threshold", default="0.025", type=str)
+
+parser.add_argument('-P', "--mev-perturbed-file", help="file containing the perturbed macroeconomic condition", default="economic_indicators_210810", type=str)
+parser.add_argument('-S', '--sensitivity', help='SENSITIVITY', default=0, type=int)
+parser.add_argument('-nl', '--noise-level', help='NOISE_LEVEL', default=0.75, type=float)
+parser.add_argument('-pred', '--predictors', help="predictors", default=["gdp__real__lcu"], type=list)
+
+args, unknown = parser.parse_known_args()
+# % }}}1
+
+# +
+# %
+
+EXPERIMENT_NAME = args.experiment_name
+DATA_TYPE = args.data_type
+PROPERTY_TYPE = args.property_type
+
+CLUSTER_EXPERIMENT_ID = args.cluster_experiment_id
+CLUSTER_RUN_ID = args.cluster_run_id
+
+CLUSTER_ID = args.cluster_id
+N_PCA_FACTORS_RANGE = args.n_pca_factors_range
+CHAIN_LENGTH_RANGE = args.chain_length_range
+EXCLUDE_PERIOD_RANGE = args.exclude_period_range
+
+MEV_BASE_FILE = args.mev_base_file
+
+HELPER_SCENARIOS = args.helper_scenarios # set to True if scenarios be added to improve the fit of the HB Model
+CORRELATION_THRESHOLD = args.correlation_threshold # define the cutoff for helper scenarios to be added
+MIN_NUMBER_OF_HELPERS = args.min_number_of_helpers
+
+MSE_THRESHOLD = args.mse_threshold
+MEV_PERTURBED_FILE = args.mev_perturbed_file
+
+SENSITIVITY = args.sensitivity
+NOISE_LEVEL = args.noise_level
+PREDICTORS = args.predictors
+
+#EXPERIMENT_NAME_CLUSTERING = EXPERIMENT_NAME + '_' + time_string
+EXPERIMENT_NAME_GRID_SEARCH = EXPERIMENT_NAME + '_CLUSTER_ID_' + str(CLUSTER_ID) + '_GRID_Search_' + time_string
+EXPERIMENT_NAME_MODEL_COMPARISON = EXPERIMENT_NAME + '_CLUSTER_ID_' + str(CLUSTER_ID) + '_Model_Comparison_' + time_string
+EXPERIMENT_NAME_FINAL_TRAIN = EXPERIMENT_NAME + '_CLUSTER_ID_' + str(CLUSTER_ID) + '_FINAL_TRAIN_' + time_string
+EXPERIMENT_NAME_DELTA = EXPERIMENT_NAME + '_CLUSTER_ID_' + str(CLUSTER_ID) + '_DELTA_CALCULATE_' + time_string
+# %
+# -
+
+# % Block for single scenario clusters
+if int(HELPER_SCENARIOS):
+    df = return_processed_data(DATA_TYPE=DATA_TYPE, PROPERTY_TYPE=PROPERTY_TYPE, PERIOD='all')
+    cluster_path = cf.MLFLOW_TRACKING_DIR + f"{CLUSTER_EXPERIMENT_ID}/{CLUSTER_RUN_ID}/artifacts/clusters.csv"
+    clusters = pd.read_csv(cluster_path)
+    correlation_threshold = float(CORRELATION_THRESHOLD)
+    i = correlation_threshold
+    while i >= 0.30: 
+        print(round(i,2))
+        helper_scenarios = get_helpers(df, clusters, int(CLUSTER_ID), round(i,2))
+        scenarios = helper_scenarios["sector"]
+        if len(scenarios) >= int(MIN_NUMBER_OF_HELPERS):
+            print(scenarios.values)
+            CORRELATION_THRESHOLD = str(i)
+            break
+        i = i - 0.10
+# %
+
+# +
+# # % arguments parsing
+# call_string = "python /opt/app/src/main/2_cluster_scenarios.py" + " -x " + EXPERIMENT_NAME_CLUSTERING \
+# + " -dt " + DATA_TYPE + " -pt " + str(PROPERTY_TYPE)
+# output = subprocess.check_call(call_string, shell=True)
+# if output != 0:
+#     exit()
+# # %
+# -
+
+mlflow.set_tracking_uri(cf.MLFLOW_TRACKING_DIR)
+
+# +
+# experiments = MlflowClient().get_experiment_by_name(EXPERIMENT_NAME_CLUSTERING)
+# runs = MlflowClient().search_runs(experiments.experiment_id,
+#                                   run_view_type=ViewType.ALL,
+#                                 max_results=1,
+#   order_by=["tag.end_time DESC"]
+# )[0]
+
+# +
+# cluster_experiment_id = runs.info.experiment_id
+# cluster_run_id = runs.info.run_id
+
+cluster_experiment_id = CLUSTER_EXPERIMENT_ID
+cluster_run_id = CLUSTER_RUN_ID
+# -
+
+EXPERIMENT_NAME_GRID_SEARCH='ci_clusters_CLUSTER_ID_1_GRID_Search_28_10_2021_11_30_00'
+
+N_PCA_FACTORS_RANGE='9,13'
+
+# +
+N_PCA_START, N_PCA_STOP = N_PCA_FACTORS_RANGE.split(",")
+CHAIN_LENGTH_LIST = CHAIN_LENGTH_RANGE.split(",")
+EXCLUDE_PERIOD_LIST = EXCLUDE_PERIOD_RANGE.split(",")
+
+for n_pca_factors in range(int(N_PCA_START),int(N_PCA_STOP)+1,1):
+    print(n_pca_factors)
+    for chain_length in CHAIN_LENGTH_LIST:
+        print(chain_length)
+        for exclude_period in EXCLUDE_PERIOD_LIST:
+            print(exclude_period)
+            call_string = "python /opt/app/src/main/3_train_hbm.py -X " + cluster_experiment_id +\
+            " -R " + cluster_run_id + " -n " + str(n_pca_factors) + " -i " + CLUSTER_ID + " -l " +\
+            str(chain_length) + " -L " + str(chain_length) + " -t " + str(chain_length) +\
+            " -m " + MEV_BASE_FILE + " -hs " + HELPER_SCENARIOS +\
+            " -dt " + DATA_TYPE + " -pt " + str(PROPERTY_TYPE) +\
+            " -ct " + CORRELATION_THRESHOLD + " -e " + exclude_period +\
+            " -x " + EXPERIMENT_NAME_GRID_SEARCH
+            output = subprocess.check_call(call_string, shell=True)
+            if output != 0:
+                exit()
+# -
+
+experiments = MlflowClient().get_experiment_by_name(EXPERIMENT_NAME_GRID_SEARCH)
+runs = MlflowClient().search_runs(experiments.experiment_id,
+                                  run_view_type=ViewType.ALL,
+                                max_results=1,
+  order_by=["tag.end_time DESC"]
+)[0]
+
+call_string = "python /opt/app/src/main/5.5_models_comparison.py -X " +\
+    runs.info.experiment_id + " -th " + MSE_THRESHOLD + " -m " + MEV_BASE_FILE +\
+    " -x " + EXPERIMENT_NAME_MODEL_COMPARISON
+output = subprocess.check_call(call_string, shell=True)
+if output != 0:
+    exit()
+
+#EXPERIMENT_NAME_MODEL_COMPARISON = 'ci_clusters_CLUSTER_ID_1_Model_Comparison_28_10_2021_18_09_41'
+#EXPERIMENT_NAME_MODEL_COMPARISON = 'ci_cluster5_subcluster9_CLUSTER_ID_9_Model_Comparison_04_11_2021_07_46_51'
+
+
+experiments = MlflowClient().get_experiment_by_name(EXPERIMENT_NAME_MODEL_COMPARISON)
+runs = MlflowClient().search_runs(experiments.experiment_id,
+                                  run_view_type=ViewType.ALL,
+                                max_results=1,
+  order_by=["tag.end_time DESC"]
+)[0]
+
+params_dict = runs.to_dictionary()['data']['params']
+n_pca_factors = params_dict['N_PCA_FACTORS']
+chain_length = params_dict['CHAIN_LENGTH']
+EXCLUDE_PERIOD_START = params_dict['EXCLUDE_PERIOD_START']
+EXCLUDE_PERIOD_STOP = params_dict['EXCLUDE_PERIOD_STOP']
+exclude_period = EXCLUDE_PERIOD_START + ':' + EXCLUDE_PERIOD_STOP
+
+call_string = "python /opt/app/src/main/3.5_train_hbm_full.py -X " + cluster_experiment_id +\
+    " -R " + cluster_run_id + " -n " + str(n_pca_factors) + " -i " + CLUSTER_ID + " -l " +\
+    str(chain_length) + " -L " + str(chain_length) + " -t " + str(chain_length) +\
+    " -m " + MEV_BASE_FILE + " -hs " + HELPER_SCENARIOS +\
+    " -dt " + DATA_TYPE + " -pt " + str(PROPERTY_TYPE) +\
+    " -ct " + CORRELATION_THRESHOLD + " -e " + exclude_period +\
+    " -x " + EXPERIMENT_NAME_FINAL_TRAIN
+output = subprocess.check_call(call_string, shell=True)
+if output != 0:
+    exit()
+
+experiments = MlflowClient().get_experiment_by_name(EXPERIMENT_NAME_FINAL_TRAIN)
+runs = MlflowClient().search_runs(experiments.experiment_id,
+                                  run_view_type=ViewType.ALL,
+                                max_results=1,
+  order_by=["tag.end_time DESC"]
+)[0]
+
+runs
+
+final_train_experiment_id = runs.to_dictionary()['info']['experiment_id']
+final_train_run_id = runs.to_dictionary()['info']['run_id']
+#final_data_type = runs.to_dictionary()['data']['params']['DATA_TYPE']
+
+call_string = "python /opt/app/src/main/4_make_predictions.py -X " +\
+    final_train_experiment_id + " -R " + final_train_run_id +\
+    " -P " + MEV_PERTURBED_FILE + " -x " + EXPERIMENT_NAME_DELTA +\
+    " -dt " + DATA_TYPE + " -pt " + str(PROPERTY_TYPE) +\
+    " -m " + MEV_BASE_FILE + " -L " + chain_length +\
+    " -S " + str(SENSITIVITY) + " -nl " + str(NOISE_LEVEL) + " -pred " + str(PREDICTORS)
+output = subprocess.check_call(call_string, shell=True)
+if output != 0:
+    exit()
+
+experiments = MlflowClient().get_experiment_by_name(EXPERIMENT_NAME_DELTA)
+runs = MlflowClient().search_runs(experiments.experiment_id,
+                                  run_view_type=ViewType.ALL,
+                                max_results=1,
+  order_by=["tag.end_time DESC"]
+)[0]
+
+runs.to_dictionary()['info']
+
+
